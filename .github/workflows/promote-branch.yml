@@ -1,0 +1,183 @@
+name: Promote Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: "Source branch to promote"
+        required: true
+        type: string
+        default: develop
+
+      target_branch:
+        description: "Target branch to update"
+        required: true
+        type: string
+        default: qa
+
+permissions:
+  contents: write
+
+# Never let two promotions race on the same target ref. Promotions are not
+# cancel-safe, so an in-flight run always finishes before the next starts.
+concurrency:
+  group: promote-${{ inputs.target_branch }}
+  cancel-in-progress: false
+
+env:
+  # Allowed promotion paths, one "source:target" pair per line. The source side
+  # accepts a glob (e.g. "hotfix/*") so version-specific branches don't need to
+  # be enumerated; the target side must be an exact branch name.
+  ALLOWED_PROMOTIONS: |
+    develop:qa
+    qa:staging
+    staging:main
+    hotfix/*:main
+
+jobs:
+  promote:
+    name: Fast-forward target branch
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate promotion path
+        env:
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          echo "Requested promotion: $SOURCE_BRANCH -> $TARGET_BRANCH"
+
+          allowed=false
+          while IFS= read -r pair; do
+            # Ref names cannot contain whitespace, so stripping it is safe.
+            pair="${pair//[[:space:]]/}"
+            [ -z "$pair" ] && continue
+
+            pair_source="${pair%%:*}"
+            pair_target="${pair##*:}"
+
+            [ "$pair_target" = "$TARGET_BRANCH" ] || continue
+
+            case "$SOURCE_BRANCH" in
+              $pair_source)
+                allowed=true
+                break
+                ;;
+            esac
+          done <<< "$ALLOWED_PROMOTIONS"
+
+          if [ "$allowed" != "true" ]; then
+            echo "::error::'$SOURCE_BRANCH' -> '$TARGET_BRANCH' is not an allowed promotion path."
+            echo ""
+            echo "Allowed paths:"
+            echo "$ALLOWED_PROMOTIONS"
+            exit 1
+          fi
+
+          echo "Promotion path is allowed."
+
+      - name: Resolve branch SHAs
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          # Diagnostics go to stderr so they reach the log instead of being
+          # captured by the command substitution at the call site.
+          resolve_branch() {
+            local branch="$1"
+            local sha
+
+            if ! sha=$(gh api "repos/$REPO/git/ref/heads/$branch" --jq '.object.sha' 2>/dev/null); then
+              echo "::error::Branch '$branch' does not exist in $REPO." >&2
+              return 1
+            fi
+
+            if [ -z "$sha" ] || [ "$sha" = "null" ]; then
+              echo "::error::Could not resolve a commit SHA for branch '$branch'." >&2
+              return 1
+            fi
+
+            printf '%s' "$sha"
+          }
+
+          SOURCE_SHA=$(resolve_branch "$SOURCE_BRANCH") || exit 1
+          TARGET_SHA=$(resolve_branch "$TARGET_BRANCH") || exit 1
+
+          echo "Source: $SOURCE_BRANCH @ $SOURCE_SHA"
+          echo "Target: $TARGET_BRANCH @ $TARGET_SHA"
+
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+
+          if [ "$SOURCE_SHA" = "$TARGET_SHA" ]; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "Source and target are already at the same commit."
+            {
+              echo "### Promotion skipped"
+              echo ""
+              echo "\`$TARGET_BRANCH\` is already at \`$SOURCE_SHA\` (same as \`$SOURCE_BRANCH\`)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify fast-forward
+        if: steps.resolve.outputs.needs_update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          SOURCE_SHA: ${{ steps.resolve.outputs.source_sha }}
+          TARGET_SHA: ${{ steps.resolve.outputs.target_sha }}
+        run: |
+          RESULT=$(gh api "repos/$REPO/compare/$TARGET_SHA...$SOURCE_SHA" --jq '.status')
+
+          echo "Comparison status: $RESULT"
+
+          if [ "$RESULT" != "ahead" ]; then
+            echo "::error::'$TARGET_BRANCH' cannot be fast-forwarded to '$SOURCE_BRANCH' (status: $RESULT)."
+            echo ""
+            echo "Source: $SOURCE_BRANCH @ $SOURCE_SHA"
+            echo "Target: $TARGET_BRANCH @ $TARGET_SHA"
+            echo ""
+            echo "The target branch may contain commits that are not"
+            echo "present in the source branch."
+            exit 1
+          fi
+
+          echo "Fast-forward validation successful."
+
+      - name: Fast-forward target branch
+        if: steps.resolve.outputs.needs_update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          SOURCE_SHA: ${{ steps.resolve.outputs.source_sha }}
+          TARGET_SHA: ${{ steps.resolve.outputs.target_sha }}
+        run: |
+          # force=false makes the API reject anything that is not a
+          # fast-forward, which also closes the race between the compare
+          # above and this update.
+          gh api \
+            --method PATCH \
+            "repos/$REPO/git/refs/heads/$TARGET_BRANCH" \
+            -f sha="$SOURCE_SHA" \
+            -F force=false
+
+          echo "Successfully promoted $SOURCE_BRANCH -> $TARGET_BRANCH at $SOURCE_SHA"
+
+          {
+            echo "### Promoted \`$SOURCE_BRANCH\` to \`$TARGET_BRANCH\`"
+            echo ""
+            echo "| | Branch | Commit |"
+            echo "| --- | --- | --- |"
+            echo "| Source | \`$SOURCE_BRANCH\` | \`$SOURCE_SHA\` |"
+            echo "| Target (before) | \`$TARGET_BRANCH\` | \`$TARGET_SHA\` |"
+            echo "| Target (after) | \`$TARGET_BRANCH\` | \`$SOURCE_SHA\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
