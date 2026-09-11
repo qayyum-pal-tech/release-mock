@@ -28,6 +28,13 @@ export default function Home() {
             center.
           </p>
         </div>
+        <p>
+          lorem ipsum dolor sit amet consectetur adipiscing elit animi qui qui
+          qui cupidatat nulla cum soluta odio et consequat aute aliquip
+          consequatur illum voluptas cupiditate et corrupti temporibus rerum
+          excepturi mollit lorem nam vel sunt sunt tempore occaecat soluta quod
+          mollitia dolore id nihil sit fugiat deleniti eum commodo quo
+        </p>
         <p>{count}</p>
         <button onClick={() => setCount((old) => old + 1)}>Click Me</button>
         <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
