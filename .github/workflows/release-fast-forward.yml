@@ -1,0 +1,254 @@
+name: Release Fast-Forward to Main
+
+run-name: "Promote ${{ inputs.source_branch }} -> main (@${{ github.actor }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: "Source branch to promote (must match release/* or hotfix/*)"
+        required: true
+        type: string
+
+      # workflow_dispatch has no read-only inputs; a single-option choice is the
+      # closest equivalent. The job ignores it and uses env.TARGET_BRANCH.
+      target_branch:
+        description: "Target branch (fixed)"
+        required: true
+        type: choice
+        options:
+          - main
+        default: main
+
+# GITHUB_TOKEN only reads. The ref update uses a GitHub App token whose
+# credentials live in the protected environment below, so a modified copy of
+# this file on another branch cannot write to main.
+permissions:
+  contents: read
+  checks: read
+
+# Promotions are not cancel-safe, so an in-flight run always finishes first.
+concurrency:
+  group: promote-main
+  cancel-in-progress: false
+
+env:
+  TARGET_BRANCH: main
+  # Globs for branches allowed to fast-forward into TARGET_BRANCH.
+  ALLOWED_SOURCES: |
+    release/*
+    hotfix/*
+
+jobs:
+  promote:
+    name: Fast-forward main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Dispatching from another ref would execute that ref's copy of this file.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    # Configure with required reviewers and deployment branches = main only.
+    environment: release-promotion
+
+    steps:
+      - name: Validate inputs
+        env:
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          REQUESTED_TARGET: ${{ inputs.target_branch }}
+        run: |
+          echo "Requested promotion: $SOURCE_BRANCH -> $TARGET_BRANCH"
+
+          # Guards against API dispatches that bypass the UI dropdown.
+          if [ "$REQUESTED_TARGET" != "$TARGET_BRANCH" ]; then
+            echo "::error::Target must be '$TARGET_BRANCH' (got '$REQUESTED_TARGET')."
+            exit 1
+          fi
+
+          # The name is interpolated into API paths: '#', '%' and '?' are legal
+          # in git refs but would break or redirect the URL.
+          if [[ ! "$SOURCE_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] \
+            || ! git check-ref-format "refs/heads/$SOURCE_BRANCH"; then
+            echo "::error::'$SOURCE_BRANCH' is not a valid or supported branch name."
+            exit 1
+          fi
+
+          allowed=false
+          while IFS= read -r pattern; do
+            pattern="${pattern//[[:space:]]/}"
+            [ -z "$pattern" ] && continue
+            # Unquoted on purpose so the pattern is matched as a glob.
+            case "$SOURCE_BRANCH" in
+              $pattern) allowed=true; break ;;
+            esac
+          done <<< "$ALLOWED_SOURCES"
+
+          if [ "$allowed" != "true" ]; then
+            echo "::error::'$SOURCE_BRANCH' is not allowed to fast-forward into '$TARGET_BRANCH'."
+            echo ""
+            echo "Allowed source patterns:"
+            echo "$ALLOWED_SOURCES"
+            exit 1
+          fi
+
+          echo "Promotion path is allowed."
+
+      - name: Resolve branch SHAs
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+        run: |
+          # Diagnostics go to stderr so they reach the log instead of being
+          # captured by the command substitution at the call site.
+          resolve_branch() {
+            local branch="$1"
+            local sha
+
+            if ! sha=$(gh api "repos/$REPO/git/ref/heads/$branch" --jq '.object.sha' 2>/dev/null); then
+              echo "::error::Branch '$branch' does not exist in $REPO." >&2
+              return 1
+            fi
+
+            if [ -z "$sha" ] || [ "$sha" = "null" ]; then
+              echo "::error::Could not resolve a commit SHA for branch '$branch'." >&2
+              return 1
+            fi
+
+            printf '%s' "$sha"
+          }
+
+          SOURCE_SHA=$(resolve_branch "$SOURCE_BRANCH") || exit 1
+          TARGET_SHA=$(resolve_branch "$TARGET_BRANCH") || exit 1
+
+          echo "Source: $SOURCE_BRANCH @ $SOURCE_SHA"
+          echo "Target: $TARGET_BRANCH @ $TARGET_SHA"
+
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+
+          if [ "$SOURCE_SHA" = "$TARGET_SHA" ]; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "Source and target are already at the same commit."
+            {
+              echo "### Promotion skipped"
+              echo ""
+              echo "\`$TARGET_BRANCH\` is already at \`$SOURCE_SHA\` (same as \`$SOURCE_BRANCH\`)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify checks on source commit
+        if: steps.resolve.outputs.needs_update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ steps.resolve.outputs.source_sha }}
+        run: |
+          # Covers check runs (GitHub Actions and most CI apps); legacy commit
+          # statuses are not included.
+          runs=$(gh api --paginate "repos/$REPO/commits/$SOURCE_SHA/check-runs?per_page=100" \
+            --jq '.check_runs[] | "\(.name)\t\(.status)\t\(.conclusion // "-")"')
+
+          if [ -z "$runs" ]; then
+            # Change to exit 1 if every release commit must have CI results.
+            echo "::warning::No check runs found on $SOURCE_SHA."
+            exit 0
+          fi
+
+          bad=$(printf '%s\n' "$runs" | awk -F'\t' \
+            '$2 != "completed" || ($3 != "success" && $3 != "skipped" && $3 != "neutral")')
+
+          if [ -n "$bad" ]; then
+            echo "::error::Source commit has pending or failing checks."
+            printf '%s\n' "$bad"
+            exit 1
+          fi
+
+          echo "All check runs on $SOURCE_SHA passed."
+
+      - name: Verify fast-forward
+        if: steps.resolve.outputs.needs_update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          SOURCE_SHA: ${{ steps.resolve.outputs.source_sha }}
+          TARGET_SHA: ${{ steps.resolve.outputs.target_sha }}
+        run: |
+          RESULT=$(gh api "repos/$REPO/compare/$TARGET_SHA...$SOURCE_SHA" --jq '.status')
+
+          echo "Comparison status: $RESULT"
+
+          if [ "$RESULT" != "ahead" ]; then
+            echo "::error::'$TARGET_BRANCH' cannot be fast-forwarded to '$SOURCE_BRANCH' (status: $RESULT)."
+            echo ""
+            echo "Source: $SOURCE_BRANCH @ $SOURCE_SHA"
+            echo "Target: $TARGET_BRANCH @ $TARGET_SHA"
+            echo ""
+            echo "The target branch contains commits that are not in the source"
+            echo "branch. Merge or rebase '$TARGET_BRANCH' into '$SOURCE_BRANCH' first."
+            exit 1
+          fi
+
+          echo "Fast-forward validation successful."
+
+      - name: Create promotion token
+        id: app-token
+        if: steps.resolve.outputs.needs_update == 'true'
+        # Pin to a full commit SHA before use.
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PROMOTION_APP_ID }}
+          private-key: ${{ secrets.PROMOTION_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Fast-forward target branch
+        if: steps.resolve.outputs.needs_update == 'true'
+        env:
+          # App token, not GITHUB_TOKEN: pushes made with GITHUB_TOKEN do not
+          # trigger downstream "on: push" workflows on main.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          SOURCE_SHA: ${{ steps.resolve.outputs.source_sha }}
+          TARGET_SHA: ${{ steps.resolve.outputs.target_sha }}
+        run: |
+          # force=false makes the API reject anything that is not a
+          # fast-forward, which also closes the race between the compare
+          # above and this update.
+          if ! gh api \
+            --method PATCH \
+            "repos/$REPO/git/refs/heads/$TARGET_BRANCH" \
+            -f sha="$SOURCE_SHA" \
+            -F force=false > /dev/null; then
+            echo "::error::GitHub rejected the update of '$TARGET_BRANCH'."
+            echo "Either '$TARGET_BRANCH' moved since the compare step (re-run the"
+            echo "workflow), or branch rules do not allow the promotion App to push."
+            exit 1
+          fi
+
+          echo "Successfully promoted $SOURCE_BRANCH -> $TARGET_BRANCH at $SOURCE_SHA"
+
+          {
+            echo "### Promoted \`$SOURCE_BRANCH\` to \`$TARGET_BRANCH\`"
+            echo ""
+            echo "| | Branch | Commit |"
+            echo "| --- | --- | --- |"
+            echo "| Source | \`$SOURCE_BRANCH\` | \`$SOURCE_SHA\` |"
+            echo "| Target (before) | \`$TARGET_BRANCH\` | \`$TARGET_SHA\` |"
+            echo "| Target (after) | \`$TARGET_BRANCH\` | \`$SOURCE_SHA\` |"
+            echo ""
+            echo "Requested by @$GITHUB_ACTOR"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summarise failure
+        if: failure()
+        env:
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+        run: |
+          {
+            echo "### Promotion failed"
+            echo ""
+            echo "\`$SOURCE_BRANCH\` was not promoted to \`$TARGET_BRANCH\`. See the step logs for the reason."
+          } >> "$GITHUB_STEP_SUMMARY"
